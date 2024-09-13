@@ -1,0 +1,305 @@
+---
+title: "ANÁLISE DIFERENCIAL DE GENES MITOCONDRIAIS"
+author: "Diego Pereira"
+date: "2023-05-04"
+output:
+html_document: default
+pdf_document: default
+editor_options:
+  chunk_output_type: console
+chunk_output_type: console
+---
+## Carregando os pacotes necessários
+```{r}
+library(tximport)
+library(org.Hs.eg.db)
+library(annotate)
+library(reshape2)
+library(tidyverse)
+library(knitr)
+library(gridExtra)
+library(DESeq2)
+library(ggfortify)
+library(pROC)
+library(plotly)
+library(ComplexHeatmap)
+library(clusterProfiler)
+library(kableExtra)
+library(ggrepel)
+library(ggpubr)
+library(gridExtra)
+library(gplots)
+library(ggplot2)
+library(AnnotationDbi)
+library(tibble)
+library(readxl)
+library(enrichplot)
+library(ReactomePA)
+```
+
+## Carregando as tabelas com os dados de expressão
+```{r}
+load("txi_145.RData")
+sampleTable = read_xlsx("sample_table_145.xlsx")
+rownames(sampleTable) = sampleTable$samples
+```
+
+## Removendo algumas amostras
+```{r}
+samples_remove = c("190708", "190506TU", "190611TU", "190624", "190121TU",
+                   "200713ADJ", "200713TU", "200122ADJ", "200122TU")
+sampleTable = sampleTable[!rownames(sampleTable) %in% samples_remove, ]
+txi$abundance = txi$abundance[,!colnames(txi$abundance) %in% samples_remove]
+txi$counts = txi$counts[,!colnames(txi$counts) %in% samples_remove]
+txi$length = txi$length[,!colnames(txi$length) %in% samples_remove]
+row.names(sampleTable) = sampleTable$samples
+```
+
+## Filtrando os genes mitocondriais
+```{r}
+count_data_filter = as.data.frame(txi$counts)
+genes_mito = read.table("genes_mitocondriais.txt")
+k = match(genes_mito$gene_name, rownames(count_data_filter))
+txi$abundance = txi$abundance[k,]
+txi$counts = txi$counts[k,]
+txi$length = txi$length[k,]
+all(row.names(sampleTable) == colnames(txi$abundance))
+```
+
+## Análise diferencial (GC vs ADJ)
+```{r}
+dds = DESeqDataSetFromTximport(txi,
+                               colData = sampleTable, 
+                               design = ~ type)
+genes.dds = DESeq(dds)
+caso_controle.res = results (genes.dds, contrast = c('type', "GC", "ADJ"))
+caso_controle = as.data.frame(caso_controle.res[complete.cases(caso_controle.res),])
+k = caso_controle$padj<0.5 & (abs(caso_controle$log2FoldChange)>1)
+diff = row.names(caso_controle[k,])
+length(diff)
+genedif = caso_controle[k,]
+```
+
+## Volcano plot
+```{r}
+caso_controle$threshold = as.factor(k)
+VOLC = ggplot(data = caso_controle) +
+   geom_point(mapping = aes(x = log2FoldChange, y = -log10(padj), color = factor(threshold, labels = c("No DE", "DE"))), size = 2) + 
+   labs(color = "Expression") +
+   xlab("log2FoldChange") + ylab("-log10 p-adj") +
+   scale_color_manual(values = c("#00AFBB", "#bb0c00")) +
+   geom_text_repel(data = genedif, aes(label = diff, x = log2FoldChange, y = -log10(padj)), size = 3.0, fontface = 3)
+VOLC
+
+#Volcano 2
+
+caso_controle$threshold = as.factor(k)
+VOLC = ggplot(data = caso_controle) +
+   geom_point(mapping = aes(x = log2FoldChange, y = -log10(padj), color = factor(threshold, labels = c("No DE", "DE"))), size = 2) +
+  theme_classic() +
+  geom_vline(xintercept = c(-1, 1), col = "gray", linetype = 'dashed') +
+  geom_hline(yintercept = -log10(0.05), col = "gray", linetype = 'dashed') +
+  scale_color_manual(values = c("gray", "blue"), labels = c("No DE", "DE")) +
+  coord_cartesian(ylim = c(0, 20), xlim = c(-5, 3)) +
+  labs(color = "Expression", x = expression("log"[2]*"FC"), y = expression("-log"[10]*"p-adj")) +
+  scale_x_continuous(breaks = seq(-6, 6, 2)) +
+  geom_text_repel(data = genedif, aes(label = diff, x = log2FoldChange, y = -log10(padj)), size = 3.0, fontface = 3.0)
+VOLC
+```
+
+## Normalização e log
+```{r}
+genes.dds.norm = estimateSizeFactors(genes.dds)
+tabela.norm = as.data.frame(counts(genes.dds.norm, normalized = T), stringsAsFactors = F)
+log.tabela.norm = as.matrix(log(tabela.norm + 1))
+```
+
+## Análise ROC
+```{r}
+par(pty="s") 
+k = match(diff, row.names(tabela.norm))
+diff.tabela.norm = as.matrix(log.tabela.norm[k,])
+soma = colSums(diff.tabela.norm)
+k = soma == 0
+diff.tabela.norm = diff.tabela.norm[,!k]
+k = sampleTable$type == "GC"
+sampleTable$pred[k] = 1
+sampleTable$pred[!k] = 0
+tab.roc = cbind(sampleTable, t(diff.tabela.norm))
+auc = data.frame(marker = 0, auc = 0, ind = 0, ic_inf = 0, ic_sup = 0, stringsAsFactors = F)
+cont = 0
+
+par(mfrow = c(3,3))
+for (i in 8 : ncol(tab.roc)) {
+    roc.test = roc(tab.roc$pred, tab.roc[,i], ci = TRUE)
+if (roc.test$auc > 0.7) { 
+      cont = cont+1
+      plot(roc.test, col = "blue", main = colnames(tab.roc[i]), xlab = paste("Specificity, AUC = " ,round(roc.test$auc, digits = 2), sep = ""))
+      auc[cont,] = c(colnames(tab.roc[i]), roc.test$auc, i, roc.test$ci[1], roc.test$ci[3])
+    }
+}
+```
+
+## Heatmap
+```{r}
+rld = varianceStabilizingTransformation(dds, blind = T)
+plotPCA(rld, intgroup = c("type"))
+data = assay(rld)
+data = as.matrix(data)
+k = match(diff, row.names(data))
+data1 = data[k,]
+
+df = data.frame(Type = sampleTable$type)
+cores = list(Type = c("#00AFBB", "#bb0c00"))
+names(cores$Type) = c("GC", "ADJ")
+ha_columns = HeatmapAnnotation(df = df, col = cores)
+
+HM = Heatmap(data1, name = "Vst", top_annotation = ha_columns, 
+             show_row_names = T, row_names_gp = gpar(fontsize = 8),
+             show_column_names = T, column_names_gp = gpar(fontsize = 8),
+             clustering_distance_columns = "spearman",
+             clustering_method_columns = "average", cluster_rows = T)
+draw(HM, heatmap_legend_side = "left", annotation_legend_side = "bottom")
+```
+
+## Análise de componentes principais (PCA)
+```{r}
+auc.pca = prcomp(t(data1))
+PCA = autoplot(auc.pca, data = cbind(t(data1), sampleTable), colour = "type", size = 2, label = F, frame = F) +
+  theme(legend.text = element_text(size = 10), legend.position = "bottom")
+print(PCA)
+```
+
+## Corelação com dados clinico-patológicos
+```{r}
+TNORM = as.data.frame(t(log.tabela.norm))
+TNORM$samples = row.names(TNORM)
+sampleTable$samples = row.names(TNORM)
+TNORM = merge(sampleTable, TNORM, by.x = "samples", by.y = "samples")
+row.names(TNORM) = TNORM$samples
+
+# Type
+select = TNORM[, c("MT-TN", "MT-TC", "type")]
+data2 = melt(select, id.var = "type")
+par(pty = "s")
+
+MITOPLOT = ggplot(data = data2, aes(x = type, y = value)) + 
+  geom_boxplot(aes(fill = type)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) + 
+  stat_compare_means(size = 3, vjust = 1, hjust = 0)
+MITOPLOT
+
+# Neoadjuvância
+select = TNORM[, c("MT-TN", "MT-TC", "Neoadjuvância")]
+data2 = melt(select, id.var = "Neoadjuvância")
+par(pty = "s")
+
+MITOPLOT = ggplot(data = data2, aes(x = Neoadjuvância, y = value)) + 
+  geom_boxplot(aes(fill = Neoadjuvância)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) + 
+  stat_compare_means(size = 3, vjust = 1, hjust = 0)
+MITOPLOT
+
+# status Hpyl
+select = TNORM[, c("MT-TN", "MT-TC", "Hpyl")]
+data2 = melt(select, id.var = "Hpyl")
+par(pty = "s")
+
+MITOPLOT = ggplot(data = data2, aes(x = Hpyl, y = value)) + 
+  geom_boxplot(aes(fill = Hpyl)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) + 
+  stat_compare_means(size = 3, vjust = 1, hjust = 0)
+MITOPLOT
+
+# Removendo as amostras adjacentes
+k = grep("ADJ", x = amostras$type, ignore.case = T, invert = T)
+amostras = amostras[k,]
+TNORM = as.data.frame(t(log.tabela.norm))
+k = match(amostras$samples, row.names(TNORM))
+TNORM = TNORM[k,]
+TNORM$samples = row.names(TNORM)
+amostras$samples = row.names(TNORM)
+TNORM = merge(amostras, TNORM, by.x = "samples", by.y ="samples")
+row.names(TNORM) = TNORM$samples
+
+# Status EBV
+select = TNORM[, c("MT-TA", "MT-TN", "MT-TC", "MT-TY", "MT-TS1", "EBV")]
+data2 = melt(select, id.var = "EBV")
+par(pty = "s")
+
+MITOPLOT = ggplot(data = data2, aes(x = EBV, y = value)) + 
+  geom_boxplot(aes(fill = EBV)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) + 
+  stat_compare_means(size = 3, vjust = 1, hjust = 0)
+MITOPLOT
+
+# Removendo amostras sem dados de Lauren e TNM
+k = row.names(TNORM) == "190603"
+TNORM = TNORM[!k,]
+k = row.names(amostras) == "190603"
+amostras = amostras[!k,]
+
+# Lauren
+select = TNORM[, c("MT-TA", "MT-TN", "MT-TC", "MT-TY", "MT-TS1", "Lauren")]
+data2 = melt(select, id.var = "Lauren")
+par(pty = "s")
+
+MITOPLOT = ggplot(data = data2, aes(x = Lauren, y = value)) + 
+  geom_boxplot(aes(fill = Lauren)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) + 
+  stat_compare_means(size = 3, vjust = 1, hjust = 0)
+MITOPLOT
+
+# Estadiamento patológico
+select = TNORM[, c("MT-TA", "MT-TN", "MT-TC", "MT-TY", "MT-TS1", "Estadiamento.patológico")]
+data2 = melt(select, id.var = "Estadiamento.patológico")
+par(pty = "s")
+
+# my_comparisons = list( c("I", "II"), c("I", "III"), c("I", "IV")) 
+
+MITOPLOT = ggplot(data = data2, aes(x = Estadiamento.patológico, y = value)) + 
+  geom_boxplot(aes(fill = Estadiamento.patológico)) +
+  geom_jitter(colour = "black", width = 0.1, cex = 1.0) +
+  facet_wrap( ~ variable, scales = "free") +
+  theme_bw(base_size = 12) + 
+  scale_fill_manual(values = c("#00AFBB", "#bb0c00", "skyblue3", "palegreen4")) +
+  xlab("") + ylab("") + 
+  theme(legend.position = "top", panel.background = element_blank(), strip.background = element_rect(colour = "black", fill = "white"), strip.text.x = element_text(colour = "black", face = "bold.italic", size = 16)) +
+  stat_compare_means(size = 3, vjust = 1, hjust = -1)
+MITOPLOT
+```
+
+### Análise de componentes principais (PCA)
+```{r}
+auc.pca = prcomp(t(data1))
+PCA = autoplot(auc.pca, data = cbind(t(data1), amostras), colour = "type", size = 2, label = F, frame = F) +
+  theme(legend.text = element_text(size = 10), legend.position = "bottom")
+print(PCA)
+```
+
+
